@@ -1,5 +1,6 @@
 *
 !setup_env.ps1
 !align_deposition.py
+!error.txt
 !README.md
 !.gitignore
