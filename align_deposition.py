@@ -4,6 +4,7 @@ import sys
 import glob
 import json
 import wave
+import difflib
 import sqlite3
 import argparse
 import subprocess
@@ -12,7 +13,9 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import torch
+import torchaudio
 from num2words import num2words
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from ctc_forced_aligner import (
     load_audio,
     load_alignment_model,
@@ -24,6 +27,7 @@ from ctc_forced_aligner import (
 )
 
 MODEL_ID = "MahmoudAshraf/mms-300m-1130-forced-aligner"
+ANCHOR_ASR_MODEL = "openai/whisper-base.en"
 
 ABBREV_MAP = {
     "mr": ["mister"],
@@ -50,7 +54,7 @@ ABBREV_MAP = {
 class MediaSegment:
     index: int              # 1-based index (1, 2, 3...)
     id_stem: str            # Filename without extension
-    full_path: str          # Full path or media path string
+    full_path: str          # Full path string
     duration_sec: float     # Exact duration in floating-point seconds
     offset_sec: float       # Cumulative start offset in floating-point seconds
 
@@ -80,7 +84,6 @@ class MainRow:
     temp: str                       # 'PG' or 'LN'
     text: str                       # Exact original line text (preserving leading spaces/line numbers)
     native: Optional[str] = None
-    is_spoken_section: bool = False
 
 
 def natural_sort_key(path_str: str):
@@ -230,12 +233,9 @@ def expand_token_to_spoken_words(raw_token: str) -> List[str]:
 
 def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[WordToken], int, int]:
     """
-    Parses a legal deposition ASCII transcript into OnCue/Sanction MainRow records:
-    - Preserves exact original text (including leading indentation & line numbers) in Main.Text.
-    - Marks Page Header lines with Temp='PG', LineNum=0, Timestamp=None.
-    - Marks numbered lines (1-25) with Temp='LN', LineNum=1..25.
-    - Automatically detects where spoken testimony begins (e.g. 'THE VIDEOGRAPHER:', 'EXAMINATION',
-      'WHEREUPON', 'sworn', or 'Q.') so cover/appearance pages stay unsynced just like Sanction!
+    Parses all pages and numbered lines (1-25) into MainRow objects and tokenizes
+    candidate spoken words across the entire transcript so the Acoustic Anchor
+    (or manual --start-page/--start-line) can slice the exact starting point.
     """
     raw_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
@@ -245,16 +245,14 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
     speaker_re = re.compile(
         r"^\s*((?:MR\.|MS\.|MRS\.|DR\.|THE\s+WITNESS|THE\s+VIDEOGRAPHER|THE\s+COURT|THE\s+REPORTER|BY\s+MR\.|BY\s+MS\.)[A-Z\s\.\-]{1,35}):\s*(.*)$"
     )
-    speech_start_trigger = re.compile(
-        r"(THE\s+VIDEOGRAPHER\s*:|VIDEOGRAPHER\s*:|on\s+the\s+record|having\s+been\s+first\s+duly\s+sworn|EXAMINATION\s+BY|^\s*\d{1,2}\s+Q\.)",
+    paren_re = re.compile(
+        r"\((?:[^)]*?(?:off the record|recess|marked|exhibit|playing|concluded|stenographically)[^)]*?)\)",
         re.IGNORECASE
     )
-    paren_re = re.compile(r"\((?:[^)]*?(?:off the record|recess|marked|exhibit|playing|concluded|stenographically)[^)]*?)\)", re.IGNORECASE)
 
     current_page = 1
     max_page = 1
     max_line_per_page = 25
-    speech_started = False
 
     main_rows: List[MainRow] = []
     word_tokens: List[WordToken] = []
@@ -265,7 +263,6 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
         clean_raw = raw.replace("\f", "")
         stripped = clean_raw.strip()
 
-        # Skip completely blank lines outside of 1-25 numbered blocks
         if not stripped:
             continue
 
@@ -287,7 +284,6 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
                     temp="PG",
                     text=clean_raw,
                     native=None,
-                    is_spoken_section=False,
                 )
             )
             continue
@@ -299,33 +295,25 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
             max_line_per_page = max(max_line_per_page, line_num)
             content = m_line.group(3).strip()
         else:
-            # Unnumbered line—skip or attach as Line 0 header
             continue
-
-        # Check if spoken record has begun (skips cover page, caption, and appearances)
-        if not speech_started and speech_start_trigger.search(clean_raw):
-            speech_started = True
 
         row_counter += 1
-        m_row = MainRow(
-            index=row_counter,
-            timecode=None,
-            page_num=current_page,
-            line_num=line_num,
-            no_display=False,
-            redact=False,
-            timestamp=" ",
-            temp="LN",
-            text=clean_raw,
-            native=None,
-            is_spoken_section=speech_started,
+        main_rows.append(
+            MainRow(
+                index=row_counter,
+                timecode=None,
+                page_num=current_page,
+                line_num=line_num,
+                no_display=False,
+                redact=False,
+                timestamp=" ",
+                temp="LN",
+                text=clean_raw,
+                native=None,
+            )
         )
-        main_rows.append(m_row)
 
-        if not speech_started:
-            continue
-
-        # Strip parentheticals, speaker labels, and Q/A markers for acoustic alignment
+        # Strip non-spoken parentheticals, speaker labels, and Q/A markers
         spoken_candidate = paren_re.sub(" ", content).strip()
 
         m_spk = speaker_re.match(spoken_candidate)
@@ -351,29 +339,6 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
                     )
                 )
 
-    # Fallback: if no trigger phrase matched (e.g. non-standard transcript), align all numbered lines
-    if not speech_started and main_rows:
-        print("Notice: Standard videographer/Q&A header not detected; aligning all numbered lines.")
-        for m_row in main_rows:
-            if m_row.temp == "LN":
-                m_row.is_spoken_section = True
-                m_line = line_re.match(m_row.text)
-                content = m_line.group(3).strip() if m_line else m_row.text
-                for raw_w in content.split():
-                    subwords = expand_token_to_spoken_words(raw_w)
-                    if subwords:
-                        word_counter += 1
-                        word_tokens.append(
-                            WordToken(
-                                word_id=word_counter,
-                                main_index=m_row.index,
-                                page_num=m_row.page_num,
-                                line_num=m_row.line_num,
-                                raw_word=raw_w,
-                                spoken_subwords=subwords,
-                            )
-                        )
-
     return main_rows, word_tokens, max_page, max_line_per_page
 
 
@@ -382,7 +347,7 @@ def extract_and_concat_16k_wav(video_paths: List[Path], combined_wav_path: Path)
     cumulative_samples = 0
     sample_rate = 16000
 
-    print(f"[1/4] Extracting & joining 16kHz mono audio across {len(video_paths)} video file(s)...")
+    print(f"[1/5] Extracting & joining 16kHz mono audio across {len(video_paths)} video file(s)...")
 
     with wave.open(str(combined_wav_path), "wb") as wav_out:
         wav_out.setnchannels(1)
@@ -429,10 +394,151 @@ def extract_and_concat_16k_wav(video_paths: List[Path], combined_wav_path: Path)
     return segments
 
 
-def run_forced_alignment(wav_path: Path, word_tokens: List[WordToken], batch_size: int = 16):
+def find_acoustic_start_anchor(
+    wav_path: Path,
+    word_tokens: List[WordToken],
+    start_page_override: Optional[int] = None,
+    start_line_override: Optional[int] = None,
+    search_audio_sec: int = 180,
+    max_preamble_words: int = 4500,
+) -> Tuple[int, float]:
+    """
+    Determines the exact starting WordToken index and starting audio offset (in seconds):
+    1. If --start-page is provided, jumps directly to that Page/Line.
+    2. Otherwise, transcribes the first `search_audio_sec` (3 minutes) of audio using
+       cached Whisper-Base.en and slides a 10-word window across the first ~25 pages
+       of the transcript to lock onto the exact first spoken phrase.
+    """
+    if start_page_override is not None:
+        min_line = start_line_override if start_line_override is not None else 1
+        for i, w in enumerate(word_tokens):
+            if w.page_num > start_page_override or (w.page_num == start_page_override and w.line_num >= min_line):
+                print(f"[2/5] Manual Anchor Override: Starting at Page {w.page_num}, Line {w.line_num} (Word: '{w.raw_word}')")
+                return i, 0.0
+        return 0, 0.0
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    print(f"[2/4] Loading MMS-300M Aligner on {device.upper()} ({dtype})...")
+
+    print(f"[2/5] Running Acoustic Preamble Anchor on first {search_audio_sec}s of audio...")
+
+    processor = AutoProcessor.from_pretrained(ANCHOR_ASR_MODEL)
+    asr_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        ANCHOR_ASR_MODEL, torch_dtype=dtype
+    ).to(device)
+
+    waveform, sr = torchaudio.load(str(wav_path), frame_offset=0, num_frames=16000 * search_audio_sec)
+    audio_np = waveform.squeeze(0).numpy()
+
+    chunk_len = 16000 * 30
+    heard_words: List[Tuple[str, float]] = []  # (clean_word, approx_audio_sec)
+
+    for offset_samples in range(0, len(audio_np), chunk_len):
+        chunk = audio_np[offset_samples : offset_samples + chunk_len]
+        if len(chunk) < 16000:
+            break
+        chunk_start_sec = offset_samples / 16000.0
+        chunk_dur_sec = len(chunk) / 16000.0
+
+        inputs = processor(
+            chunk, sampling_rate=16000, return_tensors="pt", return_attention_mask=True
+        )
+        input_features = inputs.input_features.to(device, dtype=dtype)
+
+        with torch.no_grad():
+            generated_ids = asr_model.generate(input_features)
+        text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        words_in_chunk = [
+            re.sub(r"[^a-zA-Z']", "", w).lower()
+            for w in text.split()
+            if re.sub(r"[^a-zA-Z']", "", w)
+        ]
+        for idx_w, cw in enumerate(words_in_chunk):
+            est_sec = chunk_start_sec + (idx_w / max(1, len(words_in_chunk))) * chunk_dur_sec
+            heard_words.append((cw, est_sec))
+
+    del asr_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    if len(heard_words) < 10:
+        print("      Very little speech heard in opening window; using structural fallback.")
+        return _structural_fallback_anchor(word_tokens), 0.0
+
+    # Flatten the first `max_preamble_words` transcript tokens for matching
+    search_limit = min(len(word_tokens), max_preamble_words)
+    transcript_norm = [
+        w.spoken_subwords[0] if w.spoken_subwords else re.sub(r"[^a-zA-Z']", "", w.raw_word).lower()
+        for w in word_tokens[:search_limit]
+    ]
+
+    window_size = 10
+    best_score = 0.0
+    best_tok_idx = 0
+    best_heard_idx = 0
+
+    for h_start in range(0, min(len(heard_words) - window_size, 80), 3):
+        heard_phrase = " ".join(hw[0] for hw in heard_words[h_start : h_start + window_size])
+
+        for t_idx in range(0, search_limit - window_size):
+            cand_phrase = " ".join(transcript_norm[t_idx : t_idx + window_size])
+            ratio = difflib.SequenceMatcher(None, heard_phrase, cand_phrase).ratio()
+            if ratio > best_score:
+                best_score = ratio
+                best_tok_idx = t_idx
+                best_heard_idx = h_start
+                if ratio > 0.92:
+                    break
+        if best_score > 0.92:
+            break
+
+    if best_score >= 0.72:
+        # Walk backward equally in both streams to find where the shared speech actually starts
+        if best_tok_idx >= best_heard_idx:
+            # Normal case: Transcript has unspoken preamble before video starts
+            final_tok_idx = best_tok_idx - best_heard_idx
+            audio_offset_sec = 0.0
+        else:
+            # Reverse case: Videographer spoke on video before the transcript started
+            final_tok_idx = 0
+            untranscribed_heard_idx = best_heard_idx - best_tok_idx
+            audio_offset_sec = max(0.0, heard_words[untranscribed_heard_idx][1] - 2.0)
+
+        # Snap to the first word of that transcript line so the entire line gets synced cleanly
+        target_main_idx = word_tokens[final_tok_idx].main_index
+        while final_tok_idx > 0 and word_tokens[final_tok_idx - 1].main_index == target_main_idx:
+            final_tok_idx -= 1
+
+        anchor_w = word_tokens[final_tok_idx]
+        print(
+            f"      Anchor Locked ({best_score*100:.1f}% match)! "
+            f"Speech begins at Page {anchor_w.page_num}, Line {anchor_w.line_num} "
+            f"(Word: '{anchor_w.raw_word}', Audio Offset: {audio_offset_sec:.2f}s)"
+        )
+        return final_tok_idx, audio_offset_sec
+
+    print(f"      Acoustic similarity low ({best_score*100:.1f}%); using structural fallback.")
+    return _structural_fallback_anchor(word_tokens), 0.0
+
+
+def _structural_fallback_anchor(word_tokens: List[WordToken]) -> int:
+    """Fallback if opening audio is noisy: finds first VIDEOGRAPHER / EXAMINATION / Q. token."""
+    for i, w in enumerate(word_tokens[:3000]):
+        if w.raw_word.upper().startswith(("VIDEOGRAPHER", "EXAMINATION", "MORNING", "AFTERNOON")):
+            return i
+    return 0
+
+
+def run_forced_alignment(
+    wav_path: Path,
+    active_word_tokens: List[WordToken],
+    audio_offset_sec: float = 0.0,
+    batch_size: int = 16
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"[3/5] Loading MMS-300M Aligner on {device.upper()} ({dtype})...")
 
     alignment_model, alignment_tokenizer = load_alignment_model(
         device,
@@ -442,20 +548,26 @@ def run_forced_alignment(wav_path: Path, word_tokens: List[WordToken], batch_siz
 
     audio_waveform = load_audio(str(wav_path), alignment_model.dtype, alignment_model.device)
 
-    print(f"[3/4] Generating acoustic emissions (batch_size={batch_size})...")
+    # If the video has untranscribed speech at the very start, slice the waveform at audio_offset_sec
+    if audio_offset_sec > 0.0:
+        offset_samples = int(audio_offset_sec * 16000)
+        if offset_samples < audio_waveform.shape[-1]:
+            audio_waveform = audio_waveform[..., offset_samples:]
+
+    print(f"[4/5] Generating acoustic emissions (batch_size={batch_size})...")
     emissions, stride = generate_emissions(
         alignment_model, audio_waveform, batch_size=batch_size
     )
 
     flat_subwords: List[str] = []
     token_slices = []
-    for w_tok in word_tokens:
+    for w_tok in active_word_tokens:
         start_idx = len(flat_subwords)
         flat_subwords.extend(w_tok.spoken_subwords)
         end_idx = len(flat_subwords)
         token_slices.append((w_tok, start_idx, end_idx))
 
-    print(f"      Aligning {len(word_tokens)} transcript words ({len(flat_subwords)} expanded phonetic subwords)...")
+    print(f"      Aligning {len(active_word_tokens)} active transcript words ({len(flat_subwords)} phonetic subwords)...")
     full_spoken_text = " ".join(flat_subwords)
 
     tokens_starred, text_starred = preprocess_text(
@@ -478,21 +590,16 @@ def run_forced_alignment(wav_path: Path, word_tokens: List[WordToken], batch_siz
         sub_slice = aligned_subwords[s_idx:e_idx]
         if not sub_slice:
             continue
-        w_tok.start_sec = float(sub_slice[0]["start"])
-        w_tok.end_sec = float(sub_slice[-1]["end"])
+        w_tok.start_sec = float(sub_slice[0]["start"]) + audio_offset_sec
+        w_tok.end_sec = float(sub_slice[-1]["end"]) + audio_offset_sec
         avg_score = sum(float(item.get("score", 0.0)) for item in sub_slice) / len(sub_slice)
         w_tok.score = round(avg_score, 4)
 
 
-def populate_oncue_main_timecodes(main_rows: List[MainRow], word_tokens: List[WordToken]):
-    """
-    Populates Main.Timecode (float seconds) and Main.Timestamp ('HH:MM:SS')
-    from the first spoken word on each line, and smoothly interpolates any
-    speaker-only or blank lines inside the spoken testimony block.
-    """
+def populate_oncue_main_timecodes(main_rows: List[MainRow], active_word_tokens: List[WordToken]):
     row_map = {r.index: r for r in main_rows}
 
-    for w in word_tokens:
+    for w in active_word_tokens:
         if w.start_sec is None:
             continue
         r = row_map[w.main_index]
@@ -500,7 +607,6 @@ def populate_oncue_main_timecodes(main_rows: List[MainRow], word_tokens: List[Wo
             r.timecode = w.start_sec
             r.timestamp = format_hhmmss(w.start_sec)
 
-    # Interpolate any empty/speaker-header 'LN' lines inside the active testimony range
     synced_indices = [i for i, r in enumerate(main_rows) if r.timecode is not None]
     if not synced_indices:
         return
@@ -508,7 +614,7 @@ def populate_oncue_main_timecodes(main_rows: List[MainRow], word_tokens: List[Wo
     first_synced_pos = synced_indices[0]
     last_synced_pos = synced_indices[-1]
 
-    # Set the line immediately preceding first spoken line to 0.0 (matches Sanction behavior)
+    # Set the line immediately preceding first spoken line to 0.0 (matches Sanction convention)
     if first_synced_pos > 0 and main_rows[first_synced_pos - 1].temp == "LN":
         prev_r = main_rows[first_synced_pos - 1]
         prev_r.timecode = 0.0
@@ -538,9 +644,8 @@ def export_oncue_mdb_and_sqlite(
     main_rows: List[MainRow],
     word_tokens: List[WordToken],
 ):
-    print(f"[4/4] Exporting OnCue/Sanction .mdb and word-level .sqlite to {out_prefix}.* ...")
+    print(f"[5/5] Exporting OnCue/Sanction .mdb and word-level .sqlite to {out_prefix}.* ...")
 
-    # 1. Export SQLite (contains Info, MPEGS, Main, AND word-level AlignedWords)
     sqlite_path = out_prefix.with_suffix(".sqlite")
     if sqlite_path.exists():
         sqlite_path.unlink()
@@ -595,7 +700,6 @@ def export_oncue_mdb_and_sqlite(
     conn_sq.close()
     print(f"  -> Saved SQLite DB (with word-level table): {sqlite_path}")
 
-    # 2. Export Genuine Jet 3.5 (Access 97 / Sanction format) .mdb via built-in 32-bit Windows DAO.DBEngine.36
     mdb_path = out_prefix.with_suffix(".mdb").resolve()
     if mdb_path.exists():
         mdb_path.unlink()
@@ -644,17 +748,14 @@ def export_oncue_mdb_and_sqlite(
 
     payload_json.write_text(json.dumps(payload_data), encoding="utf-8")
 
-    # DAO Type Constants: dbBoolean=1, dbLong=4, dbSingle=6, dbText=10, dbMemo=12, dbVersion30=32 (Jet 3.5)
     ps_dao_builder = r"""
 param([string]$JsonPath)
 $ErrorActionPreference = "Stop"
 $data = Get-Content -Raw -Encoding UTF8 $JsonPath | ConvertFrom-Json
 
 $dbe = New-Object -ComObject DAO.DBEngine.36
-# dbVersion30 = 32 creates exact Jet 3.5 format used by Sanction & OnCue
 $db = $dbe.CreateDatabase($data.mdb_path, ";LANGID=0x0409;CP=1252;COUNTRY=0", 32)
 
-# 1. Create Info Table
 $tInfo = $db.CreateTableDef("Info")
 $tInfo.Fields.Append($tInfo.CreateField("Index", 4))
 $tInfo.Fields.Append($tInfo.CreateField("StartPage", 4))
@@ -668,7 +769,6 @@ $f = $tInfo.CreateField("LastName", 10, 100);   $f.AllowZeroLength = $true; $tIn
 $f = $tInfo.CreateField("Date", 10, 50);        $f.AllowZeroLength = $true; $tInfo.Fields.Append($f)
 $db.TableDefs.Append($tInfo)
 
-# 2. Create Main Table
 $tMain = $db.CreateTableDef("Main")
 $tMain.Fields.Append($tMain.CreateField("Index", 4))
 $tMain.Fields.Append($tMain.CreateField("Timecode", 6))
@@ -682,7 +782,6 @@ $f = $tMain.CreateField("Text", 10, 255);     $f.AllowZeroLength = $true; $tMain
 $f = $tMain.CreateField("Native", 10, 255);   $f.AllowZeroLength = $true; $tMain.Fields.Append($f)
 $db.TableDefs.Append($tMain)
 
-# 3. Create MPEGS Table
 $tMpegs = $db.CreateTableDef("MPEGS")
 $tMpegs.Fields.Append($tMpegs.CreateField("Index", 4))
 $tMpegs.Fields.Append($tMpegs.CreateField("Duration", 6))
@@ -694,7 +793,6 @@ $db.TableDefs.Append($tMpegs)
 
 $dbe.BeginTrans()
 
-# Populate Info
 $rsInfo = $db.OpenRecordset("Info")
 $rsInfo.AddNew()
 $rsInfo.Fields.Item("Index").Value = [int]$data.info.Index
@@ -708,7 +806,6 @@ $rsInfo.Fields.Item("Date").Value = [string]$data.info.Date
 $rsInfo.Update()
 $rsInfo.Close()
 
-# Populate MPEGS
 $rsMpegs = $db.OpenRecordset("MPEGS")
 foreach ($m in $data.mpegs) {
     $rsMpegs.AddNew()
@@ -722,7 +819,6 @@ foreach ($m in $data.mpegs) {
 }
 $rsMpegs.Close()
 
-# Populate Main
 $rsMain = $db.OpenRecordset("Main")
 foreach ($r in $data.main) {
     $rsMain.AddNew()
@@ -774,6 +870,8 @@ def main():
     parser.add_argument("--first-name", default="First", help="Witness First Name for OnCue Info table")
     parser.add_argument("--last-name", default="Last", help="Witness Last Name for OnCue Info table")
     parser.add_argument("--date", default="01/01/2026", help="Deposition Date (MM/DD/YYYY) for OnCue Info table")
+    parser.add_argument("--start-page", type=int, default=None, help="Optional manual override: Page number where speech starts")
+    parser.add_argument("--start-line", type=int, default=1, help="Optional manual override: Line number (1-25) where speech starts")
     parser.add_argument("--batch-size", type=int, default=16, help="GPU batch size (16-32 for RTX 40/50 series)")
     args = parser.parse_args()
 
@@ -787,11 +885,25 @@ def main():
 
     try:
         main_rows, word_tokens, max_page, lines_per_page = parse_deposition_for_oncue(transcript_path)
-        print(f"Parsed {len(main_rows)} total Main rows ({max_page} pages) and {len(word_tokens)} spoken words.")
+        print(f"Parsed {len(main_rows)} total Main rows ({max_page} pages) and {len(word_tokens)} candidate words.")
 
         segments = extract_and_concat_16k_wav(video_paths, temp_wav)
-        run_forced_alignment(temp_wav, word_tokens, batch_size=args.batch_size)
-        populate_oncue_main_timecodes(main_rows, word_tokens)
+
+        anchor_idx, audio_offset_sec = find_acoustic_start_anchor(
+            temp_wav,
+            word_tokens,
+            start_page_override=args.start_page,
+            start_line_override=args.start_line,
+        )
+        active_word_tokens = word_tokens[anchor_idx:]
+
+        run_forced_alignment(
+            temp_wav,
+            active_word_tokens,
+            audio_offset_sec=audio_offset_sec,
+            batch_size=args.batch_size,
+        )
+        populate_oncue_main_timecodes(main_rows, active_word_tokens)
         export_oncue_mdb_and_sqlite(
             out_prefix=out_prefix,
             first_name=args.first_name,

@@ -1,7 +1,7 @@
 # ==============================================================================
-# Portable Forced-Alignment Environment Builder (Windows + NVIDIA RTX 40/50)
+# Portable OnCue Forced-Alignment Environment Builder (Windows + RTX 40/50 GPU)
 # Includes: Micromamba, Python 3.11, PyTorch CUDA 12.8, FFmpeg, 
-#           CTC-Forced-Aligner, num2words, pyodbc, and MMS-300M (~1.2 GB).
+#           CTC-Forced-Aligner, num2words, Whisper-Base.en, and MMS-300M.
 # ==============================================================================
 
 $ErrorActionPreference = "Stop"
@@ -47,34 +47,41 @@ $PythonExe = Join-Path $EnvDir "python.exe"
 $PipExe    = Join-Path $EnvDir "Scripts\pip.exe"
 
 # 4. Install PyTorch (CUDA 12.8 for RTX 40 & 50 series) + Forced Aligner + Normalizers
-Write-Host "[5/6] Installing PyTorch (CUDA 12.8), CTC-Forced-Aligner, num2words, and pyodbc..." -ForegroundColor Cyan
+Write-Host "[5/6] Installing PyTorch (CUDA 12.8), CTC-Forced-Aligner, num2words, and Transformers..." -ForegroundColor Cyan
 & $PythonExe -m pip install --upgrade pip
 & $PipExe install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 & $PipExe install git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git --extra-index-url https://download.pytorch.org/whl/cu128
-& $PipExe install pyodbc num2words nltk transformers accelerate
+& $PipExe install num2words nltk transformers accelerate
 
 # Verify CUDA Architecture Support (sm_89 for 40-series, sm_120 for 50-series)
 & $PythonExe -c "import torch; print('Verified Torch:', torch.__version__, '| Archs:', torch.cuda.get_arch_list())"
 
-# 5. Pre-Cache the MMS-300M Alignment Model (~1.2 GB) for Offline Use
-Write-Host "[6/6] Pre-caching MMS-300M Forced Alignment Model for offline execution..." -ForegroundColor Cyan
+# 5. Pre-Cache Whisper-Base.en (~290 MB) & MMS-300M Aligner (~1.2 GB) for Offline Use
+Write-Host "[6/6] Pre-caching Whisper-Base.en & MMS-300M models for offline execution..." -ForegroundColor Cyan
 $env:HF_HOME = $CacheDir
 $env:TORCH_HOME = $CacheDir
 
 $PreCacheScript = @"
 import os
 import torch
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from ctc_forced_aligner import load_alignment_model
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float16 if device == "cuda" else torch.float32
-print(f"Downloading model weights to {os.environ.get('HF_HOME')} (Target device: {device})...")
+print(f"Downloading models to {os.environ.get('HF_HOME')} (Target device: {device})...")
+
+print("1/2 Caching openai/whisper-base.en for Acoustic Preamble Anchoring...")
+AutoProcessor.from_pretrained("openai/whisper-base.en")
+AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-base.en")
+
+print("2/2 Caching MahmoudAshraf/mms-300m-1130-forced-aligner...")
 model, tokenizer = load_alignment_model(
     device,
     model_path="MahmoudAshraf/mms-300m-1130-forced-aligner",
     dtype=dtype
 )
-print("Model successfully cached for offline use!")
+print("All models successfully cached for offline use!")
 "@
 
 $PreCachePy = Join-Path $TempDir "precache.py"
