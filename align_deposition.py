@@ -506,7 +506,6 @@ def find_acoustic_start_anchor(
         anchor_w = word_tokens[final_tok_idx]
         print(
             f"      Anchor Locked ({best_score*100:.1f}% match)! "
-            f"Speech begins at Page {anchor_w.page_num}, Line {anchor_w.line_num} "
             f"(Word: '{anchor_w.raw_word}', Audio Offset: {audio_offset_sec:.2f}s)"
         )
         return final_tok_idx, audio_offset_sec
