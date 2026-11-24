@@ -12,12 +12,11 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
-import torchaudio
 from num2words import num2words
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from ctc_forced_aligner import (
-    load_audio,
     load_alignment_model,
     generate_emissions,
     preprocess_text,
@@ -84,6 +83,20 @@ class MainRow:
     temp: str                       # 'PG' or 'LN'
     text: str                       # Exact original line text (preserving leading spaces/line numbers)
     native: Optional[str] = None
+
+
+def load_16k_wav_numpy(wav_path: Path, max_seconds: Optional[int] = None) -> np.ndarray:
+    """
+    Reads our 16kHz 16-bit mono PCM WAV directly using Python's built-in `wave` module.
+    Completely bypasses torchaudio and torchcodec DLL dependencies.
+    """
+    with wave.open(str(wav_path), "rb") as wf:
+        n_frames = wf.getnframes()
+        if max_seconds is not None:
+            n_frames = min(n_frames, int(16000 * max_seconds))
+        raw_bytes = wf.readframes(n_frames)
+    pcm_int16 = np.frombuffer(raw_bytes, dtype=np.int16)
+    return pcm_int16.astype(np.float32) / 32768.0
 
 
 def natural_sort_key(path_str: str):
@@ -232,11 +245,6 @@ def expand_token_to_spoken_words(raw_token: str) -> List[str]:
 
 
 def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[WordToken], int, int]:
-    """
-    Parses all pages and numbered lines (1-25) into MainRow objects and tokenizes
-    candidate spoken words across the entire transcript so the Acoustic Anchor
-    (or manual --start-page/--start-line) can slice the exact starting point.
-    """
     raw_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     page_re = re.compile(r"^\s*(?:Page\s+)?(\d{1,4})\s*$", re.IGNORECASE)
@@ -266,7 +274,6 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
         if not stripped:
             continue
 
-        # Detect Page Header line (Temp = 'PG', LineNum = 0)
         m_page = page_re.match(stripped)
         if m_page and int(m_page.group(1)) >= current_page:
             current_page = int(m_page.group(1))
@@ -288,7 +295,6 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
             )
             continue
 
-        # Detect numbered line 1..25 (Temp = 'LN')
         m_line = line_re.match(clean_raw)
         if m_line and 1 <= int(m_line.group(2)) <= 25:
             line_num = int(m_line.group(2))
@@ -313,7 +319,6 @@ def parse_deposition_for_oncue(file_path: Path) -> Tuple[List[MainRow], List[Wor
             )
         )
 
-        # Strip non-spoken parentheticals, speaker labels, and Q/A markers
         spoken_candidate = paren_re.sub(" ", content).strip()
 
         m_spk = speaker_re.match(spoken_candidate)
@@ -402,13 +407,6 @@ def find_acoustic_start_anchor(
     search_audio_sec: int = 180,
     max_preamble_words: int = 4500,
 ) -> Tuple[int, float]:
-    """
-    Determines the exact starting WordToken index and starting audio offset (in seconds):
-    1. If --start-page is provided, jumps directly to that Page/Line.
-    2. Otherwise, transcribes the first `search_audio_sec` (3 minutes) of audio using
-       cached Whisper-Base.en and slides a 10-word window across the first ~25 pages
-       of the transcript to lock onto the exact first spoken phrase.
-    """
     if start_page_override is not None:
         min_line = start_line_override if start_line_override is not None else 1
         for i, w in enumerate(word_tokens):
@@ -424,14 +422,14 @@ def find_acoustic_start_anchor(
 
     processor = AutoProcessor.from_pretrained(ANCHOR_ASR_MODEL)
     asr_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        ANCHOR_ASR_MODEL, torch_dtype=dtype
+        ANCHOR_ASR_MODEL, dtype=dtype
     ).to(device)
 
-    waveform, sr = torchaudio.load(str(wav_path), frame_offset=0, num_frames=16000 * search_audio_sec)
-    audio_np = waveform.squeeze(0).numpy()
+    # Read first `search_audio_sec` directly via standard library `wave` + `numpy`
+    audio_np = load_16k_wav_numpy(wav_path, max_seconds=search_audio_sec)
 
     chunk_len = 16000 * 30
-    heard_words: List[Tuple[str, float]] = []  # (clean_word, approx_audio_sec)
+    heard_words: List[Tuple[str, float]] = []
 
     for offset_samples in range(0, len(audio_np), chunk_len):
         chunk = audio_np[offset_samples : offset_samples + chunk_len]
@@ -466,7 +464,6 @@ def find_acoustic_start_anchor(
         print("      Very little speech heard in opening window; using structural fallback.")
         return _structural_fallback_anchor(word_tokens), 0.0
 
-    # Flatten the first `max_preamble_words` transcript tokens for matching
     search_limit = min(len(word_tokens), max_preamble_words)
     transcript_norm = [
         w.spoken_subwords[0] if w.spoken_subwords else re.sub(r"[^a-zA-Z']", "", w.raw_word).lower()
@@ -494,18 +491,14 @@ def find_acoustic_start_anchor(
             break
 
     if best_score >= 0.72:
-        # Walk backward equally in both streams to find where the shared speech actually starts
         if best_tok_idx >= best_heard_idx:
-            # Normal case: Transcript has unspoken preamble before video starts
             final_tok_idx = best_tok_idx - best_heard_idx
             audio_offset_sec = 0.0
         else:
-            # Reverse case: Videographer spoke on video before the transcript started
             final_tok_idx = 0
             untranscribed_heard_idx = best_heard_idx - best_tok_idx
             audio_offset_sec = max(0.0, heard_words[untranscribed_heard_idx][1] - 2.0)
 
-        # Snap to the first word of that transcript line so the entire line gets synced cleanly
         target_main_idx = word_tokens[final_tok_idx].main_index
         while final_tok_idx > 0 and word_tokens[final_tok_idx - 1].main_index == target_main_idx:
             final_tok_idx -= 1
@@ -523,7 +516,6 @@ def find_acoustic_start_anchor(
 
 
 def _structural_fallback_anchor(word_tokens: List[WordToken]) -> int:
-    """Fallback if opening audio is noisy: finds first VIDEOGRAPHER / EXAMINATION / Q. token."""
     for i, w in enumerate(word_tokens[:3000]):
         if w.raw_word.upper().startswith(("VIDEOGRAPHER", "EXAMINATION", "MORNING", "AFTERNOON")):
             return i
@@ -546,13 +538,14 @@ def run_forced_alignment(
         dtype=dtype,
     )
 
-    audio_waveform = load_audio(str(wav_path), alignment_model.dtype, alignment_model.device)
-
-    # If the video has untranscribed speech at the very start, slice the waveform at audio_offset_sec
+    # Load full 16kHz WAV directly via standard library `wave` + `numpy` (bypasses torchcodec!)
+    audio_np = load_16k_wav_numpy(wav_path)
     if audio_offset_sec > 0.0:
         offset_samples = int(audio_offset_sec * 16000)
-        if offset_samples < audio_waveform.shape[-1]:
-            audio_waveform = audio_waveform[..., offset_samples:]
+        if offset_samples < len(audio_np):
+            audio_np = audio_np[offset_samples:]
+
+    audio_waveform = torch.from_numpy(audio_np).to(dtype=alignment_model.dtype, device=alignment_model.device)
 
     print(f"[4/5] Generating acoustic emissions (batch_size={batch_size})...")
     emissions, stride = generate_emissions(
@@ -614,7 +607,6 @@ def populate_oncue_main_timecodes(main_rows: List[MainRow], active_word_tokens: 
     first_synced_pos = synced_indices[0]
     last_synced_pos = synced_indices[-1]
 
-    # Set the line immediately preceding first spoken line to 0.0 (matches Sanction convention)
     if first_synced_pos > 0 and main_rows[first_synced_pos - 1].temp == "LN":
         prev_r = main_rows[first_synced_pos - 1]
         prev_r.timecode = 0.0
